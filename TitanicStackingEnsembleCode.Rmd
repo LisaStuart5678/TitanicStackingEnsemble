@@ -1,0 +1,462 @@
+---
+title: 'Survival On the Titanic Using Stacked Ensemble'
+author: 'Lisa L Stuart'
+date: 'February 20, 2017'
+output:
+  html_document:
+    number_sections: true
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: readable
+    highlight: tango
+---
+
+# Intro
+This is my second Kaggle script!  I really wanted to improve my inital submission so I am choosing to explore and implement some ensemble methods and then pull them together in a stacking ensemble for better accuracy.  Here goes!
+
+## Load Libraries
+```{r, message = FALSE}
+# Load packages
+library(plyr)
+library('ggplot2') # visualization
+library('ggthemes') # visualization
+library('scales') # visualization
+library('dplyr') # data manipulation
+library('mice') # imputation
+library('randomForest') # classification algorithm
+```
+
+## Load Data
+```{r, message=FALSE, warning=FALSE}
+train <- read.csv('C:/Users/Lisa/Desktop/DataScienceDegree/Portfolio Projects/TitanicSurvival/input/train.csv', stringsAsFactors = F)
+test  <- read.csv('C:/Users/Lisa/Desktop/DataScienceDegree/Portfolio Projects/TitanicSurvival/input/test.csv', stringsAsFactors = F)
+
+str(train)
+str(test)
+full  <- bind_rows(train, test) # bind training & test data
+
+# check data
+str(full)
+unique(full$Survived) # values are 1, 0, and NA (for the missing Survived row in test)
+```
+
+We can see the full dataset contains 1309 observations.  
+
+Variable Name | Description
+--------------|-------------
+PassengerID   | The ID number of the passenger
+Survived      | Survived (1) or died (0) [or NA for the missing values in test]
+Pclass        | Passenger's class
+Name          | Passenger's name
+Sex           | Passenger's sex
+Age           | Passenger's age
+SibSp         | Number of siblings/spouses aboard
+Parch         | Number of parents/children aboard
+Ticket        | Ticket number
+Fare          | Fare
+Cabin         | Cabin
+Embarked      | Port of embarkation
+
+# Where are the nulls?
+```{r, message=FALSE, warning=FALSE}
+sum(is.na(full$PassengerId)) 
+sum(is.na(full$Survived)) # corresponds with the number in test set
+sum(is.na(full$Pclass)) 
+sum(is.na(full$Name)) 
+sum(is.na(full$Sex)) 
+sum(is.na(full$Age)) #263 - need some fancy imputing here!
+sum(is.na(full$SibSp)) 
+sum(is.na(full$Parch)) 
+sum(is.na(full$Ticket)) 
+sum(is.na(full$Fare)) # this shouldn't be too difficult to fill
+sum(full$Cabin == "") # yikes, most missing here!
+sum(full$Embarked == "") 
+```
+
+Turned out to be pretty important in the first model to grab the title from the name, so let's do that again:
+
+```{r, message=FALSE, warning=FALSE}
+# Grab title from passenger names
+full$Title <- gsub('(.*, )|(\\..*)', '', full$Name)
+
+# Show title counts by sex
+table(full$Sex, full$Title)
+
+# Titles with very low cell counts to be combined to "rare" level
+rare_title <- c('Dona', 'Lady', 'the Countess','Capt', 'Col', 'Don', 
+                'Dr', 'Major', 'Rev', 'Sir', 'Jonkheer')
+
+# Also reassign mlle (mademoiselle), ms, and mme (madame) accordingly
+full$Title[full$Title == 'Mlle']        <- 'Miss' 
+full$Title[full$Title == 'Ms']          <- 'Miss'
+full$Title[full$Title == 'Mme']         <- 'Mrs' 
+full$Title[full$Title %in% rare_title]  <- 'Rare Title'
+
+# Show title counts by sex again
+table(full$Sex, full$Title)
+
+# Finally, grab surname from passenger name
+full$Surname <- sapply(full$Name,  
+                      function(x) strsplit(x, split = '[,.]')[[1]][1])
+
+```
+
+## Family size
+
+```{r, message = FALSE}
+# Create a family size variable including the passenger themselves
+full$FamSize <- full$SibSp + full$Parch + 1
+
+# Create a family variable 
+full$Family <- paste(full$Surname, full$FamSize, sep='_')
+```
+
+## Plot of Family Size vs Survival Status
+
+```{r, message=FALSE, warning=FALSE}
+# Use ggplot2 to visualize the relationship between family size & survival
+ggplot(full[1:891,], aes(x = FamSize, fill = factor(Survived))) +
+  geom_bar(stat='count', position='dodge') +
+  scale_x_continuous(breaks=c(1:11)) +
+  labs(x = 'Family Size') +
+  theme_few()
+```
+
+Think I'll keep FamilySize numeric for now.
+
+```{r, message=FALSE, warning=FALSE}
+numSurvived = sum(train$Survived) # 342
+numDied = nrow(train) - numSurvived #549
+PropSurvived = numSurvived/nrow(train) # 0.3838384
+PropDied = numDied/nrow(train) # 0.6161616
+byClass <- group_by(train, Survived, Pclass)
+summarise(byClass, train = n())
+
+    
+```
+Based on these numbers, seems like class made a difference to whether or not you survived.  Let's take a look at a visual to make this more 
+clear:
+
+```{r, message=FALSE, warning=FALSE}
+# Use ggplot2 to visualize the relationship between class & survival
+ggplot(full[1:891,], aes(x = Pclass, fill = factor(Survived))) +
+  geom_bar(stat='count', position='dodge') +
+  scale_x_continuous(breaks=c(1:11)) +
+  labs(x = 'Class') +
+  theme_few()
+```
+
+## A few tables:
+For now let's look at a few tables like survival by sex and embarked by survived to get a feel for a few other relationships.
+
+```{r, message=FALSE, warning=FALSE}
+# Table for survival by sex
+table(train$Survived, train$Sex)
+table(train$Embarked, train$Survived)
+```
+
+## Add indicator columns and engineer a few features:
+Then let's add a few indicator columns missing age and cabin number, and a few columns for the number of characters in the name and ticket, 
+and then the first characters in ticket.
+
+```{r, message=FALSE, warning=FALSE}
+full$Missing_Age = ifelse(is.na(full$Age), 1, 0)
+full$Missing_Cabin = ifelse(full$Cabin == "", 1, 0)
+full$NumCharName = nchar(full$Name)
+full$NumCharTicket <- nchar(full$Ticket)
+full$FirstCharTicket<-factor(sapply(full$Ticket, function(x) strsplit(x, NULL)[[1]][1]))
+```
+
+# Let's fix what missing
+
+## Missing Embarked
+
+```{r, message=FALSE, warning=FALSE}
+# missing from Embarked
+which(full$Embarked == "") # passengers 62 and 830
+```
+
+```{r results='asis'}
+cat(paste('We will infer their values for **embarkment** based on present data that we can imagine may be relevant: 
+**passenger class** and **fare**. We see that they paid<b> $', full[c(62, 830), 'Fare'][[1]][1], '</b>and<b> $', full[c(62, 830), 
+'Fare'][[1]][2], '</b>respectively and their classes are<b>', full[c(62, 830), 'Pclass'][[1]][1], '</b>and<b>', full[c(62, 830), 
+'Pclass'][[1]][2], '</b>. So from where did they embark?'))
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Get rid of our missing passenger IDs
+embark_fare <- full %>%
+  filter(PassengerId != 62 & PassengerId != 830)
+
+# Use ggplot2 to visualize embarkment, passenger class, & median fare
+ggplot(embark_fare, aes(x = Embarked, y = Fare, fill = factor(Pclass))) +
+  geom_boxplot() +
+  geom_hline(aes(yintercept=80), 
+    colour='red', linetype='dashed', lwd=2) +
+  scale_y_continuous(labels=dollar_format()) +
+  theme_few()
+```
+
+Since both passengers with missing values are first class and the fare they both paid is $80 (which is the average fare for those 
+embarking from 'Charbourg' it makes sense to assign them both 'C' for Embarkment.
+
+```{r, message = FALSE}
+# Since their fare was $80 for 1st class, they most likely embarked from 'C'
+full$Embarked[c(62, 830)] <- 'C'
+```
+
+## Missing Fare
+
+```{r, message=FALSE, warning=FALSE}
+# missing from Fare
+which(full$Fare == "") # passenger 1044
+
+# showing the row reveals that this is a 3rd class passenger departing from 'Southampton.'
+full[1044, ]
+```
+
+So let's look at the distribution of fares for other 3rd class passengers that also departed from Southampton 
+(n = `r nrow(full[full$Pclass == '3' & full$Embarked == 'S', ]) - 1`).
+
+```{r, message=FALSE, warning=FALSE}
+ggplot(full[full$Pclass == '3' & full$Embarked == 'S', ], 
+  aes(x = Fare)) +
+  geom_density(fill = '#99d6ff', alpha=0.4) + 
+  geom_vline(aes(xintercept=median(Fare, na.rm=T)),
+    colour='red', linetype='dashed', lwd=1) +
+  scale_x_continuous(labels=dollar_format()) +
+  theme_few()
+```
+
+Seems fair to replace the NA for this passenger's fare with the median of the other 3rd class passengers who departed from Southampton 
+which is $`r  median(full[full$Pclass == '3' & full$Embarked == 'S', ]$Fare, na.rm = TRUE)`.
+
+```{r, message = FALSE, warning=FALSE}
+full$Fare[1044] <- median(full[full$Pclass == '3' & full$Embarked == 'S', ]$Fare, na.rm = TRUE)
+```
+
+## Missing Age
+
+We know from earlier that there are 263 missing age values
+
+Just for fun, let's try a few different imputation methods and see what their differences are:
+
+### Mice imputation
+
+```{r, message=FALSE, warning=FALSE}
+# Make categorical variables into factors
+factor_vars <- c('PassengerId','Pclass','Sex','Embarked',
+                 'Title','Surname','Family', 'FirstCharTicket')
+
+full[factor_vars] <- lapply(full[factor_vars], function(x) as.factor(x))
+
+# Set a random seed
+set.seed(129)
+
+# Perform mice imputation, excluding certain less-than-useful variables:
+mice_mod <- mice(full[, !names(full) %in% c('PassengerId','Name','Ticket','Cabin','Family','Surname','Survived', 'FirstCharTicket')], method='rf') 
+
+# Save the complete output 
+mice_output <- complete(mice_mod)
+```
+
+
+Now let's compare the results we get with the original distribution of passenger ages to see which looks imputation method looks best.
+
+```{r}
+# Plot age distributions
+par(mfrow=c(1,2))
+hist(full$Age, freq=F, main='Age: Original Data', 
+  col='darkgreen', ylim=c(0,0.04))
+hist(mice_output$Age, freq=F, main='Age: MICE Output', 
+  col='lightgreen', ylim=c(0,0.04))
+```
+
+Things look good, so let's replace our age vector in the original data with the output from the `mice` model.
+
+```{r}
+# Replace Age variable from the mice model.
+full$Age <- mice_output$Age
+
+# Show new number of missing Age values
+sum(is.na(full$Age))
+```
+
+# Prediction
+
+## Split into training & test sets
+
+Our first step is to split the data back into the original test and training sets.
+
+```{r}
+# Split the data back into a train set and a test set
+train <- full[1:891,]
+test <- full[892:1309,]
+```
+
+## Compare Boosting, Bagging, and Stacking Algorithms
+
+### Boosting - two of the most popular are C5.0 and Stochastic Gradient Boosting (using Gradient Boosting Modeling implementation)
+
+Note that I'm using the exact same feature variables to train the model as I did with my first Kaggle kernel using the Titanic data for a more direct comparison of the final results (score: .75120)
+
+```{r, warning=FALSE, message = FALSE}
+# Load ensemble libraries we're going to use:
+library(mlbench)
+library(caret)
+library(caretEnsemble)
+library(C50)
+library(gbm)
+library(e1071)
+
+# Example of Boosting Algorithms
+control <- trainControl(method="repeatedcv", number=10, repeats=3)
+seed <- 1234
+metric <- "Accuracy"
+# C5.0
+set.seed(seed)
+fit.c50 <- train(factor(Survived) ~ Pclass + Sex + Age + SibSp + Parch + Fare + Embarked + Title + FamSize + FirstCharTicket + Missing_Age + Missing_Cabin + NumCharName + NumCharTicket, data=train, method="C5.0", metric=metric, trControl=control)
+# Stochastic Gradient Boosting
+set.seed(seed)
+fit.gbm <- train(factor(Survived) ~ Pclass + Sex + Age + SibSp + Parch + Fare + Embarked + Title + FamSize + FirstCharTicket + Missing_Age + Missing_Cabin + NumCharName + NumCharTicket, data=train, method="gbm", metric=metric, trControl=control, verbose=FALSE)
+# summarize results
+boosting_results <- resamples(list(c5.0=fit.c50, gbm=fit.gbm))
+summary(boosting_results)
+dotplot(boosting_results)
+```
+
+We can see that the gbm algorithm produces a more accurate model with an accuracy of 83.92%.
+
+### Bagging - two of the most popular bagging machine learning algorithms are Bagged CART and Random Forest (which we used in the previous Kaggle kernel but we're using it differently here so we'll see what happens)
+
+```{r, warning=FALSE, message = FALSE}
+# load package
+library(tree)
+
+# Example of Bagging algorithms
+control2 <- trainControl(method="repeatedcv", number=10, repeats=3)
+seed <- 1234
+metric <- "Accuracy"
+# Bagged CART
+set.seed(seed)
+fit.treebag <- train(factor(Survived) ~ Pclass + Sex + Age + SibSp + Parch + Fare + Embarked + Title + FamSize + FirstCharTicket + Missing_Age + Missing_Cabin + NumCharName + NumCharTicket, data=train, method="treebag", metric=metric, trControl=control2)
+
+# Random Forest
+set.seed(seed)
+fit.rf <- train(factor(Survived) ~ Pclass + Sex + Age + SibSp + Parch + Fare + Embarked + Title + FamSize + FirstCharTicket + Missing_Age + Missing_Cabin + NumCharName + NumCharTicket, data=train, method="rf", metric=metric, trControl=control2)
+# summarize results
+bagging_results <- resamples(list(treebag=fit.treebag, rf=fit.rf))
+summary(bagging_results)
+dotplot(bagging_results)
+```
+
+We can see that random forest produces a more accurate model with an accuracy of 82.87%.
+
+### Stacking
+
+Given a list of caret models, the caretStack() function can be used to specify a higher-order model to learn how to best combine the predictions of sub-models together.
+Let's first look at creating 5 sub-models for the ionosphere dataset, specifically:
+
+* Classification and Regression Trees (CART)
+* Logistic Regression (via Generalized Linear Model or GLM)
+* k-Nearest Neighbors (kNN)
+* Support Vector Machine with a Radial Basis Kernel Function (SVM)
+
+The following creates these 4 sub-models using the helpful caretList() function.
+
+```{r, warning=FALSE, message = FALSE}
+# Example of Stacking algorithms
+
+# Load packages
+library(rpart) # for CART
+library(kernlab) # for knn
+
+# Make sure feature variable names are in correct format to avoid error when setting classProbs=TRUE in trainControl function below:
+feature.names=names(train$Survived)
+for (f in feature.names) {
+    if (class(train[[f]])=="factor") {
+        levels <- unique(c(train[[f]]))
+        train[[f]] <- factor(train[[f]],
+                             labels=make.names(levels))
+ }
+}
+
+levels <- unique(train$Survived) 
+train$Survived <- factor(train$Survived, labels=make.names(levels))
+
+# create submodels
+control3 <- trainControl(method="repeatedcv", number=10, repeats=3, savePredictions=TRUE, classProbs=TRUE)
+algorithmList <- c('rpart', 'glm', 'knn', 'svmRadial')
+set.seed(seed)
+models <- caretList(Survived ~ Pclass + factor(Sex) + Age + SibSp + Parch + Fare + factor(Embarked) + factor(Title) + FamSize + factor(FirstCharTicket) + Missing_Age + Missing_Cabin + NumCharName + NumCharTicket, data=train, trControl=control3,  methodList=algorithmList)
+results <- resamples(models)
+summary(results)
+dotplot(results)
+
+```
+
+We can see that the svmRadial creates the most accurate model with an accuracy of 82.72%.
+
+When it comes to stacking different models, it is best to use models that have low correlation since it suggests each model is contributing to the overall accuracy but in different ways.  The benefits of combining models is reduced if their correlations are highly correlated (>.75).  
+
+```{r, message = FALSE, warning=FALSE}
+# correlation between results
+modelCor(results)
+splom(results)
+```
+
+We can see that all pairs of predictions have generally low correlation. The two methods with the highest correlation between their predictions are Logistic Regression (GLM) and rpart at 0.517 correlation which is not considered high (>0.75).
+
+Now let's combine the predictions using a linear model.
+
+```{r, message = FALSE, warning=FALSE}
+# stack using glm
+stackControl <- trainControl(method="repeatedcv", number=10, repeats=3, savePredictions=TRUE, classProbs=TRUE)
+set.seed(seed)
+stack.glm <- caretStack(models, method="glm", metric="Accuracy", trControl=stackControl)
+print(stack.glm)
+```
+
+We can see that we have lifted the accuracy to 83.15% which is a small improvement over using SVM alone. This is also an improvement over using random forest alone on the dataset, as observed above.
+
+We can also use more sophisticated algorithms to combine predictions in an effort to tease out when best to use the different methods. In this case, we can use the random forest algorithm to combine the predictions.
+
+```{r, message = FALSE}
+# stack using random forest
+set.seed(seed)
+stack.rf <- caretStack(models, method="rf", metric="Accuracy", trControl=stackControl)
+print(stack.rf)
+```
+
+We can see that this has lifted the accuracy to 84.69% a nice improvement on SVM alone.
+
+## Confusion Matrix
+
+Let's measure the performance of the random forest stack by generating a confusion matrix:
+
+```{r, message=FALSE, warning=FALSE}
+
+# Note that 'X0' corresponds to 'Died'
+confusionMatrix(data = stack.rf$ens_model$pred$pred, reference = stack.rf$ens_model$pred$obs)
+```
+
+## Prediction
+
+```{r, message=FALSE, warning=FALSE}
+# Predict using the test set
+prediction <- predict(stack.rf, test)
+
+# change Survived factors back to numeric prior to predicting:
+prediction <- ifelse(prediction == "X0", 0, 1)
+
+# Save the solution to a dataframe with two columns: PassengerId and Survived (prediction)
+solution <- data.frame(PassengerID = test$PassengerId, Survived = prediction)
+
+# Write the solution to file
+write.csv(solution, file = 'stack.rf_Solution.csv', row.names = F)
+```
+
+# Conclusion
+
+Stacking models can make a considerable improvement over single models but you do run the risk of overfitting!
